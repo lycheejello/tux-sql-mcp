@@ -25,6 +25,7 @@ Run
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -476,7 +477,8 @@ def get_edi_rejected(
         date_to:    End date (YYYY-MM-DD). Defaults to now.
 
     Returns list of {partner_id, doc_type, customer_po, sales_order, filename,
-                     delivered_at, ak5_status, ak5_error_code, ack_at}.
+                     delivered_at, ak5_status, ak5_error_code, error_detail, ack_at}.
+    error_detail is a JSON array of AK3/AK4 segment errors (null if accepted).
     """
     conditions = [
         "d.direction = 'outbound'",
@@ -500,12 +502,13 @@ def get_edi_rejected(
 
     where = "WHERE " + " AND ".join(conditions)
 
-    return db.query(
+    rows = db.query(
         f"""
         SELECT d.partner_id, d.doc_type, d.st_control_num,
                d.customer_po, d.sales_order, d.filename,
                d.delivered_at, d.created_at,
-               a.ak5_status, a.ak5_error_code, a.created_at AS ack_at
+               a.ak5_status, a.ak5_error_code, a.error_detail,
+               a.created_at AS ack_at
         FROM dbo.edi_documents d
         JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
         {where}
@@ -513,6 +516,11 @@ def get_edi_rejected(
         """,
         tuple(params),
     )
+    # Parse error_detail JSON string back to structured data
+    for row in rows:
+        if row.get("error_detail"):
+            row["error_detail"] = json.loads(row["error_detail"])
+    return rows
 
 
 @mcp.tool()

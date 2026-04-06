@@ -402,7 +402,7 @@ def get_edi_order_status(customer_po: str) -> list[dict]:
         SELECT d.doc_type, d.direction, d.partner_id,
                d.st_control_num, d.customer_po, d.sales_order,
                d.filename, d.delivered_at, d.created_at,
-               a.ak5_status, a.created_at AS ack_at
+               a.ak5_status, a.ak5_error_code, a.created_at AS ack_at
         FROM dbo.edi_documents d
         LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
         WHERE d.customer_po = ?
@@ -450,6 +450,66 @@ def get_edi_unacked(
         LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
         {where}
         ORDER BY d.created_at DESC
+        """,
+        tuple(params),
+    )
+
+
+@mcp.tool()
+def get_edi_rejected(
+    partner_id: Optional[str] = None,
+    days: Optional[int] = 30,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> list[dict]:
+    """
+    Outbound EDI documents (855/856/810) whose 997 acknowledgment reported
+    Rejected (R) or Error (E) instead of Accepted (A).
+
+    These require investigation — the partner is saying they couldn't process
+    the document. Common causes: syntax errors, missing segments, invalid data.
+
+    Args:
+        partner_id: Filter to a specific partner. Omit for all.
+        days:       Look back N days. Defaults to 30. Ignored if date_from is set.
+        date_from:  Start date (YYYY-MM-DD). Overrides days.
+        date_to:    End date (YYYY-MM-DD). Defaults to now.
+
+    Returns list of {partner_id, doc_type, customer_po, sales_order, filename,
+                     delivered_at, ak5_status, ak5_error_code, ack_at}.
+    """
+    conditions = [
+        "d.direction = 'outbound'",
+        "d.doc_type IN ('855', '856', '810')",
+        "a.ak5_status IN ('R', 'E')",
+    ]
+    params: list = []
+
+    if date_from:
+        conditions.append("d.created_at >= ?")
+        params.append(date_from)
+        if date_to:
+            conditions.append("d.created_at < DATEADD(day, 1, CAST(? AS DATE))")
+            params.append(date_to)
+    else:
+        conditions.append(f"d.created_at >= DATEADD(day, -{int(days)}, SYSUTCDATETIME())")
+
+    if partner_id:
+        conditions.append("d.partner_id = ?")
+        params.append(partner_id)
+
+    where = "WHERE " + " AND ".join(conditions)
+
+    return db.query(
+        f"""
+        SELECT d.partner_id, d.doc_type, d.st_control_num,
+               d.customer_po, d.sales_order, d.filename,
+               d.delivered_at, d.created_at,
+               a.ak5_status, a.ak5_error_code, a.created_at AS ack_at
+        FROM dbo.edi_documents d
+        JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        {where}
+        ORDER BY a.created_at DESC
         """,
         tuple(params),
     )
@@ -506,7 +566,7 @@ def get_edi_partner_activity(
         SELECT d.doc_type, d.direction, d.st_control_num,
                d.customer_po, d.sales_order, d.filename,
                d.delivered_at, d.created_at, d.resent_at,
-               a.ak5_status, a.created_at AS ack_at
+               a.ak5_status, a.ak5_error_code, a.created_at AS ack_at
         FROM dbo.edi_documents d
         LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
         {where}
@@ -543,7 +603,8 @@ def get_edi_summary(
         date_to: End date (YYYY-MM-DD). Defaults to now.
 
     Returns list of dicts with group columns plus:
-      total, delivered, acked, unacked (outbound 855/856/810 only for ack counts)
+      total, delivered, acked, acked_ok, acked_rejected, unacked
+      (outbound 855/856/810 only for ack counts)
     """
     # Build WHERE
     conditions = []
@@ -601,6 +662,12 @@ def get_edi_summary(
             SUM(CASE WHEN a.id IS NOT NULL
                       AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
                      THEN 1 ELSE 0 END) AS acked,
+            SUM(CASE WHEN a.id IS NOT NULL AND a.ak5_status = 'A'
+                      AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
+                     THEN 1 ELSE 0 END) AS acked_ok,
+            SUM(CASE WHEN a.id IS NOT NULL AND a.ak5_status IN ('R', 'E')
+                      AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
+                     THEN 1 ELSE 0 END) AS acked_rejected,
             SUM(CASE WHEN d.direction = 'outbound'
                       AND d.doc_type IN ('855','856','810')
                       AND d.delivered_at IS NOT NULL

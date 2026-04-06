@@ -15,6 +15,7 @@ get_edi_order_status        EDI order lifecycle for a customer PO
 get_edi_unacked             Outbound EDI docs missing 997 acknowledgment
 get_edi_partner_activity    Recent EDI activity for a partner
 get_edi_summary             Summary counts by partner, doc type, ack status
+get_edi_unacked_aging       Unacked docs with biz-hour aging and overdue flags
 
 Run
 ---
@@ -25,6 +26,7 @@ Run
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv  # type: ignore[import-untyped]
 
@@ -613,6 +615,126 @@ def get_edi_summary(
         """,
         tuple(params),
     )
+
+
+def _biz_hours(start: datetime, end: datetime) -> float:
+    """Count hours between two datetimes, excluding Saturday and Sunday."""
+    if not start or not end or end < start:
+        return 0.0
+    total = timedelta()
+    cur = start
+    while cur < end:
+        if cur.weekday() < 5:  # Mon–Fri
+            day_end = min(end, (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0))
+            total += day_end - cur
+        cur = (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0)
+    return total.total_seconds() / 3600
+
+
+@mcp.tool()
+def get_edi_unacked_aging(
+    partner_id: Optional[str] = None,
+    doc_type: Optional[str] = None,
+) -> list[dict]:
+    """
+    Unacked outbound EDI docs with business-hours aging and partner percentiles.
+
+    For each unacked delivered doc (855/856/810), computes how many business hours
+    (Mon–Fri only) it has been waiting, and compares against that partner's
+    historical ack percentiles. Flags docs as 'overdue' if beyond the partner's
+    observed max ack time.
+
+    Args:
+        partner_id: Filter to a specific partner. Omit for all.
+        doc_type:   Filter to a specific doc type (e.g. '856'). Omit for all.
+
+    Returns list of {partner_id, doc_type, customer_po, filename, created_at,
+                     biz_hours_waiting, partner_median_h, partner_p90_h,
+                     partner_max_h, status} where status is 'ok', 'slow', or 'overdue'.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # 1. Get historical ack times per partner+doc_type
+    hist_rows = db.query("""
+        SELECT d.partner_id, d.doc_type, d.created_at AS sent, a.created_at AS acked
+        FROM dbo.edi_documents d
+        JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        WHERE d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
+    """)
+    from collections import defaultdict
+    hist: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for r in hist_rows:
+        h = _biz_hours(r["sent"], r["acked"])
+        if h > 0:
+            hist[(r["partner_id"], r["doc_type"])].append(h)
+
+    percentiles: dict[tuple[str, str], dict] = {}
+    for key, vals in hist.items():
+        vals.sort()
+        n = len(vals)
+        percentiles[key] = {
+            "median": vals[n // 2] if n else 0,
+            "p90": vals[int(n * 0.9)] if n else 0,
+            "max": vals[-1] if n else 0,
+            "n": n,
+        }
+
+    # 2. Get unacked delivered docs
+    conditions = [
+        "d.direction = 'outbound'",
+        "d.doc_type IN ('855','856','810')",
+        "d.delivered_at IS NOT NULL",
+        "a.id IS NULL",
+    ]
+    params: list = []
+    if partner_id:
+        conditions.append("d.partner_id = ?")
+        params.append(partner_id)
+    if doc_type:
+        conditions.append("d.doc_type = ?")
+        params.append(doc_type)
+
+    where = "WHERE " + " AND ".join(conditions)
+    unacked_rows = db.query(
+        f"""
+        SELECT d.partner_id, d.doc_type, d.customer_po, d.filename, d.created_at
+        FROM dbo.edi_documents d
+        LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        {where}
+        ORDER BY d.partner_id, d.doc_type, d.created_at
+        """,
+        tuple(params),
+    )
+
+    # 3. Compute aging and flag
+    results = []
+    for r in unacked_rows:
+        key = (r["partner_id"], r["doc_type"])
+        bh = round(_biz_hours(r["created_at"], now), 1)
+        p = percentiles.get(key, {"median": 0, "p90": 0, "max": 0, "n": 0})
+
+        if p["max"] > 0 and bh > p["max"]:
+            status = "overdue"
+        elif p["p90"] > 0 and bh > p["p90"]:
+            status = "slow"
+        else:
+            status = "ok"
+
+        results.append({
+            "partner_id": r["partner_id"],
+            "doc_type": r["doc_type"],
+            "customer_po": r["customer_po"],
+            "filename": r["filename"],
+            "created_at": r["created_at"],
+            "biz_hours_waiting": bh,
+            "partner_median_h": round(p["median"], 1),
+            "partner_p90_h": round(p["p90"], 1),
+            "partner_max_h": round(p["max"], 1),
+            "partner_sample_size": p["n"],
+            "status": status,
+        })
+
+    return results
 
 
 if __name__ == "__main__":

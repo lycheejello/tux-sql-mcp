@@ -523,7 +523,8 @@ def get_edi_rejected(
             SELECT MIN(a2.created_at) AS resolved_at
             FROM dbo.edi_documents d2
             JOIN dbo.edi_acknowledgments a2 ON a2.original_document_id = d2.id
-            WHERE d2.customer_po = d.customer_po
+            WHERE d.customer_po IS NOT NULL
+              AND d2.customer_po = d.customer_po
               AND d2.doc_type = d.doc_type
               AND d2.direction = 'outbound'
               AND d2.created_at > d.created_at

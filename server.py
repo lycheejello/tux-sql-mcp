@@ -12,6 +12,7 @@ get_open_pos                Open PO lines with promised dates
 get_customer_revenue        Revenue by customer for concentration analysis
 get_sales_ledger            Flexible filtered query on bi_sales_ledger
 get_edi_order_status        EDI order lifecycle for a customer PO
+get_edi_order_status_batch  EDI order lifecycle for multiple POs in one call
 get_edi_unacked             Outbound EDI docs missing 997 acknowledgment
 get_edi_partner_activity    Recent EDI activity for a partner
 get_edi_summary             Summary counts by partner, doc type, ack status
@@ -411,6 +412,45 @@ def get_edi_order_status(customer_po: str) -> list[dict]:
         """,
         (customer_po,),
     )
+
+
+@mcp.tool()
+def get_edi_order_status_batch(customer_pos: list[str]) -> dict[str, list[dict]]:
+    """
+    Full EDI lifecycle for multiple customer POs in a single call.
+    Same data as get_edi_order_status but for a batch of POs at once.
+
+    Args:
+        customer_pos: List of customer PO numbers (e.g. ['8274768', '8274769'])
+
+    Returns dict keyed by customer_po, each value is a list of
+    {doc_type, direction, partner_id, st_control_num, customer_po, sales_order,
+     filename, delivered_at, created_at, ak5_status, ak5_error_code, ack_at}
+    ordered by created_at. POs with no results are omitted.
+    """
+    if not customer_pos:
+        return {}
+
+    placeholders = ",".join("?" * len(customer_pos))
+    rows = db.query(
+        f"""
+        SELECT d.doc_type, d.direction, d.partner_id,
+               d.st_control_num, d.customer_po, d.sales_order,
+               d.filename, d.delivered_at, d.created_at,
+               a.ak5_status, a.ak5_error_code, a.created_at AS ack_at
+        FROM dbo.edi_documents d
+        LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        WHERE d.customer_po IN ({placeholders})
+        ORDER BY d.customer_po, d.created_at
+        """,
+        tuple(customer_pos),
+    )
+
+    result: dict[str, list[dict]] = {}
+    for row in rows:
+        po = row["customer_po"]
+        result.setdefault(po, []).append(row)
+    return result
 
 
 @mcp.tool()

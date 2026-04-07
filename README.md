@@ -94,6 +94,7 @@ Add to your Claude Desktop config (`claude_desktop_config.json`):
 | Tool | Description |
 |---|---|
 | `get_edi_order_status` | Full lifecycle for a customer PO (850/855/856/810 + 997 acks) |
+| `get_edi_order_status_batch` | Same as above but for multiple POs in one call |
 | `get_edi_unacked` | Outbound docs missing 997 acknowledgment |
 | `get_edi_unacked_aging` | Unacked docs with business-hour aging and overdue flags |
 | `get_edi_rejected` | 997 rejections with error detail |
@@ -110,5 +111,24 @@ Connects to Azure SQL via ODBC with Azure AD token auth. Key tables:
 - `bi_customers` — Customer master
 - `edi_documents` — EDI transaction sets (850/855/856/810/997)
 - `edi_acknowledgments` — 997 functional acknowledgment correlation
+
+### EDI file archive
+
+Raw EDI files are archived in Azure Blob Storage at:
+
+```
+https://tuxtonedisync.blob.core.windows.net/edi-sync/archive/
+```
+
+The `edi_documents.archive_path` column contains the blob path for each document. To pull a file locally:
+
+```bash
+az storage blob download \
+  --account-name tuxtonedisync \
+  --container-name edi-sync \
+  --name "archive/<path>" \
+  --file ./output.edi \
+  --auth-mode login
+```
 
 See [`schema.md`](schema.md) for full schema documentation.

@@ -462,6 +462,7 @@ def get_edi_rejected(
     days: Optional[int] = 30,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    unresolved_only: bool = False,
 ) -> list[dict]:
     """
     Outbound EDI documents (855/856/810) whose 997 acknowledgment reported
@@ -475,10 +476,14 @@ def get_edi_rejected(
         days:       Look back N days. Defaults to 30. Ignored if date_from is set.
         date_from:  Start date (YYYY-MM-DD). Overrides days.
         date_to:    End date (YYYY-MM-DD). Defaults to now.
+        unresolved_only: If true, exclude rejections where the same customer_po + doc_type
+                         has a newer accepted 997. Defaults to false (show all).
 
     Returns list of {partner_id, doc_type, customer_po, sales_order, filename,
-                     delivered_at, ak5_status, ak5_error_code, error_detail, ack_at}.
+                     delivered_at, resent_at, resolved, resolved_at,
+                     ak5_status, ak5_error_code, error_detail, ack_at}.
     error_detail is a JSON array of AK3/AK4 segment errors (null if accepted).
+    resolved is true when a newer doc for the same PO+type was accepted or the doc was resent.
     """
     conditions = [
         "d.direction = 'outbound'",
@@ -502,24 +507,41 @@ def get_edi_rejected(
 
     where = "WHERE " + " AND ".join(conditions)
 
+    # resolved_at: the earliest accepted ack for a newer doc with the same PO+type,
+    # or resent_at if the doc was manually resent.
     rows = db.query(
         f"""
         SELECT d.partner_id, d.doc_type, d.st_control_num,
                d.customer_po, d.sales_order, d.filename,
-               d.delivered_at, d.created_at,
+               d.delivered_at, d.created_at, d.resent_at,
                a.ak5_status, a.ak5_error_code, a.error_detail,
-               a.created_at AS ack_at
+               a.created_at AS ack_at,
+               COALESCE(resolved.resolved_at, d.resent_at) AS resolved_at
         FROM dbo.edi_documents d
         JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        OUTER APPLY (
+            SELECT MIN(a2.created_at) AS resolved_at
+            FROM dbo.edi_documents d2
+            JOIN dbo.edi_acknowledgments a2 ON a2.original_document_id = d2.id
+            WHERE d2.customer_po = d.customer_po
+              AND d2.doc_type = d.doc_type
+              AND d2.direction = 'outbound'
+              AND d2.created_at > d.created_at
+              AND a2.ak5_status = 'A'
+        ) resolved
         {where}
         ORDER BY a.created_at DESC
         """,
         tuple(params),
     )
-    # Parse error_detail JSON string back to structured data
     for row in rows:
         if row.get("error_detail"):
             row["error_detail"] = json.loads(row["error_detail"])
+        row["resolved"] = row["resolved_at"] is not None
+
+    if unresolved_only:
+        rows = [r for r in rows if not r["resolved"]]
+
     return rows
 
 

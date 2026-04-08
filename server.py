@@ -548,7 +548,7 @@ def get_edi_rejected(
     where = "WHERE " + " AND ".join(conditions)
 
     # resolved_at: the earliest accepted ack for a newer doc with the same PO+type,
-    # or resent_at if the doc was manually resent.
+    # an accepted ack on the same document (resend without new row), or resent_at.
     rows = db.query(
         f"""
         SELECT d.partner_id, d.doc_type, d.st_control_num,
@@ -556,7 +556,7 @@ def get_edi_rejected(
                d.delivered_at, d.created_at, d.resent_at,
                a.ak5_status, a.ak5_error_code, a.error_detail,
                a.created_at AS ack_at,
-               COALESCE(resolved.resolved_at, d.resent_at) AS resolved_at
+               COALESCE(resolved.resolved_at, same_doc.resolved_at, d.resent_at) AS resolved_at
         FROM dbo.edi_documents d
         JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
         OUTER APPLY (
@@ -570,6 +570,13 @@ def get_edi_rejected(
               AND d2.created_at > d.created_at
               AND a2.ak5_status = 'A'
         ) resolved
+        OUTER APPLY (
+            SELECT MIN(a3.created_at) AS resolved_at
+            FROM dbo.edi_acknowledgments a3
+            WHERE a3.original_document_id = d.id
+              AND a3.ak5_status = 'A'
+              AND a3.created_at > a.created_at
+        ) same_doc
         {where}
         ORDER BY a.created_at DESC
         """,
@@ -674,7 +681,8 @@ def get_edi_summary(
         date_to: End date (YYYY-MM-DD). Defaults to now.
 
     Returns list of dicts with group columns plus:
-      total, delivered, acked, acked_ok, acked_rejected, unacked
+      total, delivered, acked, acked_ok, acked_rejected, unacked,
+      bulk_acked, last_997_at
       (outbound 855/856/810 only for ack counts)
     """
     # Build WHERE
@@ -743,10 +751,25 @@ def get_edi_summary(
                       AND d.doc_type IN ('855','856','810')
                       AND d.delivered_at IS NOT NULL
                       AND a.id IS NULL THEN 1 ELSE 0 END) AS unacked,
+            ISNULL(MAX(ba.bulk_acked), 0) AS bulk_acked,
+            MAX(l997.last_997_at) AS last_997_at,
             MIN(d.created_at) AS earliest,
             MAX(d.created_at) AS latest
         FROM dbo.edi_documents d
         LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        LEFT JOIN (
+            SELECT d2.partner_id, SUM(ISNULL(a2.ak9_accepted_count, 0)) AS bulk_acked
+            FROM dbo.edi_acknowledgments a2
+            JOIN dbo.edi_documents d2 ON d2.id = a2.ack_document_id
+            WHERE a2.original_document_id IS NULL
+            GROUP BY d2.partner_id
+        ) ba ON ba.partner_id = d.partner_id
+        LEFT JOIN (
+            SELECT partner_id, MAX(created_at) AS last_997_at
+            FROM dbo.edi_documents
+            WHERE doc_type = '997' AND direction = 'inbound'
+            GROUP BY partner_id
+        ) l997 ON l997.partner_id = d.partner_id
         {where}
         GROUP BY {g['group']}
         ORDER BY {g['order']}

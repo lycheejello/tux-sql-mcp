@@ -738,25 +738,30 @@ def get_edi_summary(
             SUM(CASE WHEN d.delivered_at IS NOT NULL
                       AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
                      THEN 1 ELSE 0 END) AS delivered,
-            SUM(CASE WHEN a.id IS NOT NULL
+            SUM(CASE WHEN la.id IS NOT NULL
                       AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
                      THEN 1 ELSE 0 END) AS acked,
-            SUM(CASE WHEN a.id IS NOT NULL AND a.ak5_status = 'A'
+            SUM(CASE WHEN la.id IS NOT NULL AND la.ak5_status = 'A'
                       AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
                      THEN 1 ELSE 0 END) AS acked_ok,
-            SUM(CASE WHEN a.id IS NOT NULL AND a.ak5_status IN ('R', 'E')
+            SUM(CASE WHEN la.id IS NOT NULL AND la.ak5_status IN ('R', 'E')
                       AND d.direction = 'outbound' AND d.doc_type IN ('855','856','810')
                      THEN 1 ELSE 0 END) AS acked_rejected,
             SUM(CASE WHEN d.direction = 'outbound'
                       AND d.doc_type IN ('855','856','810')
                       AND d.delivered_at IS NOT NULL
-                      AND a.id IS NULL THEN 1 ELSE 0 END) AS unacked,
+                      AND la.id IS NULL THEN 1 ELSE 0 END) AS unacked,
             ISNULL(MAX(ba.bulk_acked), 0) AS bulk_acked,
             MAX(l997.last_997_at) AS last_997_at,
             MIN(d.created_at) AS earliest,
             MAX(d.created_at) AS latest
         FROM dbo.edi_documents d
-        LEFT JOIN dbo.edi_acknowledgments a ON a.original_document_id = d.id
+        OUTER APPLY (
+            SELECT TOP 1 a.id, a.ak5_status
+            FROM dbo.edi_acknowledgments a
+            WHERE a.original_document_id = d.id
+            ORDER BY a.created_at DESC
+        ) la
         LEFT JOIN (
             SELECT d2.partner_id, SUM(ISNULL(a2.ak9_accepted_count, 0)) AS bulk_acked
             FROM dbo.edi_acknowledgments a2
